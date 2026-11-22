@@ -2,7 +2,7 @@
 
 - **插件标识**：`size`（编译产物 `rng_size.dll`，版本 `2.1.0`）
 - **源码位置**：[size_plugin.cpp](size_plugin.cpp)
-- **宿主依赖**：`mhw_rng.dll`（Plugin SDK `kMhwRngApiVersion == 2`，仅包含头文件 [mhw_rng_api.h](include/mhw_rng_api.h)）
+- **宿主依赖**：`mhw_rng.dll`（Plugin SDK `kMhwRngApiVersion == 3`，仅包含头文件 [mhw_rng_api.h](include/mhw_rng_api.h)）
 - **接管调用点**：`RVA 0x169BA15`（位于 `nEmDtTune::cSizeTable::getSizeMultiplier` 内）
 
 本文档说明 `rng_size` 插件所依据的原版体型计算逆向逻辑、边界处理方式、按怪物条件分流实现以及命令用法。本插件也是如何使用 `mhw_rng` Pull 模式同步回调（`RegisterSlotHook`）读取调用栈上下文的官方参考实现。
@@ -121,14 +121,14 @@ return &table->rows[12]; // 偏移 +0xE0，即 100% 标准体型兜底档
 本插件目录包含独立的 SDK 头文件副本与构建脚本，可直接作为单独的 Git 仓库检出并编译：
 
 - `size_plugin.cpp`：插件主源码
-- `include/mhw_rng_api.h`：本地携带的 `mhw_rng` Plugin SDK v2 头文件副本（零 `.lib` 依赖）
+- `include/mhw_rng_api.h`：本地携带的 `mhw_rng` Plugin SDK v3 头文件副本（无需链接 `.lib`）
 - `sync_sdk.bat`：从核心框架目录更新 `include\mhw_rng_api.h` 的同步脚本
 - `build.bat`：自动查找本机 MSVC x64 工具链并输出 `build\rng_size.dll` 的单目录构建脚本
 
 常用命令：
 ```bat
 :: 1. 若核心框架更新了 mhw_rng_api.h，同步本地头文件（不传参默认查找 ..\..\include 或 %MHW_RNG_SDK_DIR%）
-sync_sdk.bat D:\path\to\mhw_rng
+sync_sdk.bat <path-to-mhw-rng>
 
 :: 2. 独立编译至 build\rng_size.dll
 build.bat
