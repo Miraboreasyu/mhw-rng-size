@@ -24,6 +24,9 @@
 //         (`g_host->...`) are NEVER invoked while holding `g_stateMx`.
 // ============================================================================
 #include "mhw_rng_api.h"
+#include "mhw_rng_math.h"
+#include "mhw_1523_world.h"
+#include "mhw_world_api.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -41,17 +44,15 @@ namespace {
 // Verified MHW:I 15.23 (Steam 15539686) RVAs & Struct Offsets:
 constexpr std::uint32_t  kRvaSizeTableGetMultRet   = 0x169BA15U; // Return RVA inside `cSizeTable::getSizeMultiplier`
 constexpr std::uintptr_t kRvaCallerFun140F5F760Ret = 0x0F5F784U; // Return RVA inside `FUN_140f5f760` (`slotPtr[6]`)
-constexpr std::uintptr_t kRvaEmSizeCalcGlobalPtr   = 0x5012908U; // `DAT_145012908` (`sEnemyTune` size table holder)
-constexpr std::uintptr_t kOffMonsterId             = 0x12280U;   // `MonsterID` (`0..101`) inside `uEnemy` / `Monster`
-constexpr std::uintptr_t kOffMonsterSizeTableIdx   = 0x773CU;    // `cSizeTable` index inside `Monster`
+constexpr std::uintptr_t kRvaEmSizeCalcGlobalPtr   = mhw1523::kRvaSEnemyTune;        // `sEnemyTune` size table holder
+constexpr std::uintptr_t kOffMonsterId             = mhw1523::kOffEnemyMonsterId;    // `MonsterID` (`0..101`) inside `uEnemy` / `Monster`
+constexpr std::uintptr_t kOffMonsterSizeTableIdx   = mhw1523::kOffEnemySizeTableIdx; // `cSizeTable` index inside `Monster`
 constexpr std::uint32_t  kMaxMonsterId             = 101U;       // `MonsterID::Fatalis == 101`
 constexpr int            kSizeTableRowCount        = 38;         // 38 rows (`88% .. 125%`) per `cSizeTable`
 
 // Open-interval `(0.0f, 100.0f)` IEEE-754 float32 bounds for `(float)u32 * (100.0f / 4294967296.0f)`:
-//   - `kMinSafeFloatU32` (`1U`)          -> `+2.3283064e-8f` (`> 0.0f`, skips `weight == 0` rows under `<=`)
-//   - `kMaxSafeFloatU32` (`0xFFFFFF00U`) -> `99.9999924f`    (`< 100.0f`, never overflows `cumWeight == 100`)
-constexpr std::uint32_t  kMinSafeFloatU32          = 0x00000001U;
-constexpr std::uint32_t  kMaxSafeFloatU32          = 0xFFFFFF00U;
+using mhw_sdk::kMinSafeFloatU32;
+using mhw_sdk::kMaxSafeFloatU32;
 
 struct MonsterEntry {
     std::uint32_t monsterId; // Runtime `*(uint32_t*)(monster + 0x12280)` (`MonsterID` enum `0..101`)
@@ -179,7 +180,23 @@ std::mutex              g_stateMx;
 SizePolicy              g_globalPolicy{};
 std::vector<SizePolicy> g_monsterPolicies;
 SpawnHistoryEntry       g_recentSpawns[4]{};
-std::size_t             g_recentCount = 0U;
+std::size_t             g_recentCount     = 0U;
+std::uint32_t           g_activeQuestId   = 0U;
+std::uint64_t           g_worldSessionGen = 0ULL;
+MhwRngHookHandle        g_worldEvTitle    = kMhwRngInvalidHandle;
+MhwRngHookHandle        g_worldEvQuest    = kMhwRngInvalidHandle;
+
+void __fastcall OnWorldEvent(const MhwRngCustomEvent* ev, void*) {
+    if (!ev || !ev->topic || !ev->payload || ev->payloadSize < sizeof(MhwWorldEventPayload)) return;
+    const auto* wp = static_cast<const MhwWorldEventPayload*>(ev->payload);
+    std::lock_guard<std::mutex> lk(g_stateMx);
+    g_worldSessionGen = wp->sessionGen;
+    g_activeQuestId   = wp->curr.inQuest ? wp->curr.questId : 0U;
+    if (std::strcmp(ev->topic, kMhwWorldEvTitleReturn) == 0) {
+        g_recentCount = 0U;
+        std::memset(g_recentSpawns, 0, sizeof(g_recentSpawns));
+    }
+}
 
 inline bool IsEn() noexcept {
     return MhwRng_HostIsEnglish(g_host);
@@ -424,24 +441,13 @@ std::string SuggestClosestMonster(const std::string& badTok) {
 //   - `0.0`   -> `1U`          (`roll = +2.3283064e-8f > 0.0f`, NEVER hits `0.0f <= 0.0f` on `weight == 0`!)
 //   - `100.0` -> `0xFFFFFF00U` (`roll =  99.9999924f < 100.0f`, NEVER overflows `cumWeight == 100`!)
 std::uint32_t Roll0To100ToSafeU32(double roll0To100) noexcept {
-    if (!(roll0To100 > 0.0)) return kMinSafeFloatU32;
-    if (roll0To100 >= 100.0) return kMaxSafeFloatU32;
-    const double scaled = (roll0To100 / 100.0) * static_cast<double>(kMaxSafeFloatU32);
-    const auto u = static_cast<std::uint64_t>(scaled + 0.5);
-    if (u <= kMinSafeFloatU32) return kMinSafeFloatU32;
-    if (u >= kMaxSafeFloatU32) return kMaxSafeFloatU32;
-    return static_cast<std::uint32_t>(u);
+    return mhw_sdk::PercentToOpenSafeU32(roll0To100);
 }
 
 // Adapts a logical `[0.0, 100.0]` roll to tables whose positive weights sum to `totalWeight != 100`
 // so `max` (`100%`) never exceeds `(float)totalWeight` and falls back to `rows[12]` (`100%`)!
 std::uint32_t AdaptRollToTableWeightSum(double rollPct0To100, std::uint32_t totalWeight) noexcept {
-    if (totalWeight == 0U || totalWeight == 100U) {
-        return Roll0To100ToSafeU32(rollPct0To100);
-    }
-    const double maxSafeRoll = std::min(100.0, static_cast<double>(totalWeight) * 0.99999);
-    const double targetRoll  = (rollPct0To100 / 100.0) * maxSafeRoll;
-    return Roll0To100ToSafeU32(targetRoll);
+    return mhw_sdk::AdaptPercentToWeightSum(rollPct0To100, totalWeight);
 }
 
 struct LiveSpawnContext {
@@ -850,6 +856,10 @@ void PrintSizeStatus() {
                            monsterSnaps.size() - showN);
     }
 
+    char worldBuf[128]{};
+    if (MhwWorld_TryFormatSummary(g_host, worldBuf, sizeof(worldBuf), en)) {
+        g_host->ChatPrintf(en ? "[size] World context: %s" : u8"[size] 世界上下文: %s", worldBuf);
+    }
     PrintSpawnHistory(false);
 }
 
@@ -1179,14 +1189,32 @@ MHW_RNG_PLUGIN_EXPORT bool MhwRngPlugin_Init(const MhwRngHostApi* host, MhwRngPl
         &Cmd_Size,
         nullptr);
     MhwRng_RegisterSubcommandCompleter(host, selfId, "size", &Complete_Size, nullptr);
+    g_worldEvTitle = MhwRng_HostSubscribeEvent(host, selfId, kMhwWorldEvTitleReturn, &OnWorldEvent, nullptr);
+    g_worldEvQuest = MhwRng_HostSubscribeEvent(host, selfId, kMhwWorldEvQuestEnter,  &OnWorldEvent, nullptr);
     return true;
 }
 
 MHW_RNG_PLUGIN_EXPORT void MhwRngPlugin_Shutdown() {
-    std::lock_guard<std::mutex> lk(g_stateMx);
-    g_globalPolicy = SizePolicy{};
-    g_monsterPolicies.clear();
-    g_recentCount = 0U;
-    g_host        = nullptr;
-    g_selfId      = 0U;
+    const MhwRngHostApi* hostCopy = nullptr;
+    MhwRngPluginId       selfCopy = 0U;
+    MhwRngHookHandle     ev1      = kMhwRngInvalidHandle;
+    MhwRngHookHandle     ev2      = kMhwRngInvalidHandle;
+    {
+        std::lock_guard<std::mutex> lk(g_stateMx);
+        hostCopy          = g_host;
+        selfCopy          = g_selfId;
+        ev1               = g_worldEvTitle;
+        ev2               = g_worldEvQuest;
+        g_worldEvTitle    = kMhwRngInvalidHandle;
+        g_worldEvQuest    = kMhwRngInvalidHandle;
+        g_activeQuestId   = 0U;
+        g_worldSessionGen = 0ULL;
+        g_globalPolicy    = SizePolicy{};
+        g_monsterPolicies.clear();
+        g_recentCount     = 0U;
+        g_host            = nullptr;
+        g_selfId          = 0U;
+    }
+    MhwRng_HostUnsubscribeEvent(hostCopy, selfCopy, ev1);
+    MhwRng_HostUnsubscribeEvent(hostCopy, selfCopy, ev2);
 }
